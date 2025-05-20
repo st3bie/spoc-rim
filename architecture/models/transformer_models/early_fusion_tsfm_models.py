@@ -115,7 +115,7 @@ class EarlyFusionCnnTransformer(nn.Module):
     ):
         visual_feats, text_feats = self.visual_encoder(
             visual_sensors, goals, text_features, non_visual_sensors
-        )
+        ) 
 
         if "last_actions" in non_visual_sensors:
             last_actions_enc = self.last_actions_embed(non_visual_sensors["last_actions"])

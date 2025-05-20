@@ -58,7 +58,7 @@ class TextCondMultiCameraVisualEncoder(nn.Module):
         self.cfg = cfg
         if cfg.image_encoder == "dinov2" and cfg.image_encoder not in IMAGE_ENCODERS:
             cfg.image_encoder = "Dinov2Small"
-            print("REAPLACING DINOV2 WITH DINOV2SMALL")
+            print("REPLACING DINOV2 WITH DINOV2SMALL")
 
         if cfg.image_encoder in IMAGE_ENCODERS:
             image_encoder_model_cls, image_encoder_cfg = IMAGE_ENCODERS[cfg.image_encoder]

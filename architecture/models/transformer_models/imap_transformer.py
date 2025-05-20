@@ -2,6 +2,7 @@ import numpy as np
 
 # TODO:
 # how to get rgb, depth, and agent pose data from input_sensors?
+# rgb: , agent pose: sample["observation"][""]
 # filter CHORES dataset to only include OBJNAV tasks: see get_dataloader in train_pl.py
 # create preproc (called by build_model) to create observation embedding (self.obs_pos_layer)
     ## use CLIP Resnet50 to encode rgb data
@@ -20,7 +21,7 @@ class ImapEmbedding(nn.Module):
         
         # lookup table
         self.imap_token_embedding = nn.Embedding(self.imap_size**2, model_config.hidden_size)
-        
+
         # tensor of 2D coordinates for imap_size x imap_size square centered around (0,0) (flattened into a single vector of coordinates so we can pass
         # it into the fully connected network)
         self.imap_pos_fts = self._create_imap_pos_features(self.imap_size) 
@@ -105,6 +106,27 @@ class IMapTransformer(nn.Module):
     ):
         model = IMapTransformer(self.cfg) # main transformer
         self.obs_pos_layer = GpsCompassEmbedding(model_config.hidden_size) # for finding positional embeddings
+
+        # model for explicit map construction auxiliary task
+        output_size = model_config.pred_map_nchannels * (model_config.pred_map_image_size**2)
+        input_size = model_config.pred_map_input_token_dim * (model_config.MAP_ENCODER.imap_size ** 2)
+        self.map_pred_layer = nn.Sequential(
+            nn.Linear(model_config.hidden_size, model_config.pred_map_input_token_dim),
+            nn.ReLU(),
+            nn.Flatten(start_dim=1),
+            nn.Dropout(model_config.dropout_rate),
+            nn.Linear(input_size, output_size),
+            nn.Sigmoid(),
+        )
+
+        # FFN to convert q_hat to visual feature prediction
+        dim_vis = 2048  # TODO: CLIP resnet50
+        if model_config.infer_depth_feature:
+            dim_vis += 2048 # depth resnet50
+        self.vis_pred_layer = nn.Sequential(
+            nn.Dropout(model_config.dropout_rate),
+            nn.Linear(model_config.hidden_size, dim_vis),
+        )
         
         if ckpt_pth is not None:
             load_pl_ckpt(model, ckpt_pth)
@@ -112,6 +134,7 @@ class IMapTransformer(nn.Module):
         # implement preprocessor for processing input_sensors
         # fields that it needs:
         # 'rgb_features', 'depth_features', 'sem_features', 'compass', 'gps', 'infer_gps', 'infer_compass', 'infer_visual_features', 'step_ids' (what action is taken at each time step)
+        
         infer_time_ids = np.array([
             np.random.randint(start_step, min(num_steps, t+max_future_step_size)) \
                 for t in range(start_step, end_step)
@@ -236,7 +259,7 @@ class IMapTransformer(nn.Module):
         # ground truth values for calculating loss
         target_visual_features = batch['infer_visual_features'] # target_visual_features[:, t] is the correct rgb values corresponding to q
         seq_visual_features = batch['rgb_features'] 
-        if self.model_config.infer_depth_feature:
+        if self.model_config.infer_depth_feature: # 'infer_visual_features' only includes rgb data so including depth data might not be a good idea?
             seq_visual_features = torch.cat([seq_visual_features, batch['depth_features']], dim=-1)
         seq_visual_features = F.normalize(seq_visual_features, p=2, dim=-1) # rgb and depth values for every time step
 
@@ -276,6 +299,7 @@ class IMapTransformer(nn.Module):
             masked_visual_preds = self.vis_pred_layer(masked_obs_hiddens)
             
             # NCE loss for visual feature prediction
+            # we want masked_visual_preds to be similar to target_visual_features[:, t] and unsimilar to all other features in seq_visual_features
             masked_visual_preds = F.normalize(masked_visual_preds, p=2, dim=-1)
             pos_sim_scores = torch.einsum(
                 'bd,bd->b', F.normalize(target_visual_features[:, t], p=2, dim=-1), 
@@ -285,7 +309,7 @@ class IMapTransformer(nn.Module):
                 'btd,bd->bt', seq_visual_features, masked_visual_preds
             )
             neg_sim_scores.masked_fill_(batch['demonstration'] == -100, -float('inf'))
-            sim_scores = torch.cat([pos_sim_scores.unsqueeze(1), neg_sim_scores], 1)
+            sim_scores = torch.cat([pos_sim_scores.unsqueeze(1), neg_sim_scores], 1)  
             sim_scores = sim_scores / 0.1
             vis_pred_losses.append(F.cross_entropy(
                 sim_scores, 
@@ -297,14 +321,9 @@ class IMapTransformer(nn.Module):
             pred_maps = self.map_pred_layer(imap_embeds).view(
                 batch_size, self.model_config.pred_map_nchannels, -1
             )
-            if self.model_config.infer_local_map_loss_type == 'mse':
-                t_map_pred_loss = F.mse_loss(
-                    pred_maps, batch['infer_local_maps'][:, t], reduction='none'
-                ).view(batch_size, -1).mean(1)
-            elif self.model_config.infer_local_map_loss_type == 'clf':
-                t_map_pred_loss = F.binary_cross_entropy(
-                    pred_maps, batch['infer_local_maps'][:, t], reduction='none'
-                ).view(batch_size, -1).mean(1)
+            t_map_pred_loss = F.binary_cross_entropy(
+                pred_maps, batch['infer_local_maps'][:, t], reduction='none'
+            ).view(batch_size, -1).mean(1)
             map_pred_losses.append(t_map_pred_loss)
 
             # semantic prediction loss
